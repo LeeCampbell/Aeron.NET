@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -19,7 +20,7 @@ namespace Adaptive.Agrona.Concurrent
     /// 
     /// Note: The wrap methods on this class are not thread safe. Concurrent access should only happen after a successful wrap.
     /// </summary>
-    public unsafe class UnsafeBuffer : IAtomicBuffer, IDisposable
+    public sealed unsafe class UnsafeBuffer : IAtomicBuffer, IDisposable
     {
         /// <summary>
         /// Buffer alignment to ensure atomic word accesses.
@@ -162,7 +163,7 @@ namespace Adaptive.Agrona.Concurrent
                 throw new ArgumentException("offset=" + offset + " length=" + length + " not valid for buffer.capacity()=" + bufferCapacity);
             }
 #endif
-            
+
             FreeGcHandle();
             _needToFreeGcHandle = false;
 
@@ -261,21 +262,21 @@ namespace Adaptive.Agrona.Concurrent
         {
             BoundsCheck0(index, BitUtil.SIZE_OF_LONG);
 
-            return Volatile.Read(ref *(long*) (_pBuffer + index));
+            return Volatile.Read(ref *(long*)(_pBuffer + index));
         }
 
         public void PutLongVolatile(int index, long value)
         {
             BoundsCheck0(index, BitUtil.SIZE_OF_LONG);
-            
-            Interlocked.Exchange(ref *(long*) (_pBuffer + index), value);
+
+            Interlocked.Exchange(ref *(long*)(_pBuffer + index), value);
         }
 
         public void PutLongOrdered(int index, long value)
         {
             BoundsCheck0(index, BitUtil.SIZE_OF_LONG);
 
-            Volatile.Write(ref *(long*) (_pBuffer + index), value);
+            Volatile.Write(ref *(long*)(_pBuffer + index), value);
         }
 
         public long AddLongOrdered(int index, long increment)
@@ -292,11 +293,11 @@ namespace Adaptive.Agrona.Concurrent
         {
             BoundsCheck0(index, BitUtil.SIZE_OF_LONG);
 
-            var original = Interlocked.CompareExchange(ref *(long*) (_pBuffer + index), updateValue, expectedValue);
+            var original = Interlocked.CompareExchange(ref *(long*)(_pBuffer + index), updateValue, expectedValue);
 
             return original == expectedValue;
         }
-        
+
         public long GetAndAddLong(int index, long delta)
         {
             BoundsCheck0(index, BitUtil.SIZE_OF_LONG);
@@ -524,10 +525,10 @@ namespace Adaptive.Agrona.Concurrent
             BoundsCheck0(index, length);
             BufferUtil.BoundsCheck(dst, offset, length);
 
-            void* source = _pBuffer + index;
-            fixed (void* destination = &dst[offset])
+            var source = _pBuffer + index;
+            fixed (byte* destination = &dst[offset])
             {
-                ByteUtil.MemoryCopy(destination, source, (uint) length);
+                ByteUtil.MemoryCopy(destination, source, (uint)length);
             }
         }
 
@@ -546,25 +547,76 @@ namespace Adaptive.Agrona.Concurrent
             BoundsCheck0(index, length);
             BufferUtil.BoundsCheck(src, offset, length);
 
-            void* destination = _pBuffer + index;
-            fixed (void* source = &src[offset])
+            var destination = _pBuffer + index;
+            fixed (byte* source = &src[offset])
             {
                 ByteUtil.MemoryCopy(destination, source, (uint)length);
             }
         }
 
+
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void PutBytes(int index, IDirectBuffer srcBuffer, int srcIndex, int length)
         {
             BoundsCheck0(index, length);
             srcBuffer.BoundsCheck(srcIndex, length);
 
-            void* destination = _pBuffer + index;
-            void* source = (byte*)srcBuffer.BufferPointer.ToPointer() + srcIndex;
-            ByteUtil.MemoryCopy(destination, source, (uint)length);
+            var destination = _pBuffer + index;
+            var source = (byte*)srcBuffer.BufferPointer.ToPointer() + srcIndex;
+
+            // NB Manual inlining slightly improves throughput here
+            // //ByteUtil.MemoryCopy(destination, source, (uint)length);
+            // //return;
+
+            var pos = 0;
+            int nextPos;
+            nextPos = pos + 64;
+            while (nextPos <= length)
+            {
+                *(ByteUtil.CopyChunk64*)(destination + pos) = *(ByteUtil.CopyChunk64*)(source + pos);
+                pos = nextPos;
+                nextPos += 64;
+            }
+            nextPos = pos + 32;
+            while (nextPos <= length)
+            {
+                *(ByteUtil.CopyChunk32*)(destination + pos) = *(ByteUtil.CopyChunk32*)(source + pos);
+                pos = nextPos;
+                nextPos += 32;
+            }
+            nextPos = pos + 16;
+            while (nextPos <= length)
+            {
+                *(decimal*)(destination + pos) = *(decimal*)(source + pos);
+                pos = nextPos;
+                nextPos += 16;
+            }
+            nextPos = pos + 8;
+            while (nextPos <= length)
+            {
+                *(long*)(destination + pos) = *(long*)(source + pos);
+                pos = nextPos;
+                nextPos += 8;
+            }
+            nextPos = pos + 4;
+            while (nextPos <= length)
+            {
+                *(int*)(destination + pos) = *(int*)(source + pos);
+                pos = nextPos;
+                nextPos += 4;
+            }
+            while (pos < length)
+            {
+                *(byte*)(destination + pos) = *(byte*)(source + pos);
+                pos++;
+            }
         }
 
+
         ///////////////////////////////////////////////////////////////////////////
-       
+
         public char GetChar(int index)
         {
             BoundsCheck0(index, BitUtil.SIZE_OF_CHAR);
@@ -606,7 +658,7 @@ namespace Adaptive.Agrona.Concurrent
         {
             var stringInBytes = new byte[length];
             GetBytes(index + BitUtil.SIZE_OF_INT, stringInBytes);
-            
+
             return Encoding.UTF8.GetString(stringInBytes);
         }
 
@@ -618,7 +670,7 @@ namespace Adaptive.Agrona.Concurrent
         public int PutStringUtf8(int index, string value, int maxEncodedSize)
         {
             var bytes = value == null
-                ? BufferUtil.NullBytes 
+                ? BufferUtil.NullBytes
                 : Encoding.UTF8.GetBytes(value);
             if (bytes.Length > maxEncodedSize)
             {
@@ -686,11 +738,11 @@ namespace Adaptive.Agrona.Concurrent
 
             var thisPointer = this._pBuffer;
             var thatPointer = (byte*)that.BufferPointer.ToPointer();
-            
+
             for (int i = 0, length = Math.Min(thisCapacity, thatCapacity); i < length; i++)
             {
                 int cmp = thisPointer[i] - thatPointer[i];
-                
+
                 if (0 != cmp)
                 {
                     return cmp;
