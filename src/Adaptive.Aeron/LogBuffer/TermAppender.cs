@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using Adaptive.Aeron.Protocol;
 using Adaptive.Agrona;
 using Adaptive.Agrona.Concurrent;
@@ -18,7 +20,7 @@ namespace Adaptive.Aeron.LogBuffer
     /// A message of type <seealso cref="FrameDescriptor.PADDING_FRAME_TYPE"/> is appended at the end of the buffer if claimed
     /// space is not sufficiently large to accommodate the message about to be written.
     /// </summary>
-    public class TermAppender
+    public unsafe class TermAppender
     {
         /// <summary>
         /// The append operation tripped the end of the buffer and needs to rotate.
@@ -31,7 +33,10 @@ namespace Adaptive.Aeron.LogBuffer
         public const int FAILED = -2;
 
         private readonly IAtomicBuffer _termBuffer;
+        private readonly IntPtr _termBufferPointer;
         private readonly IAtomicBuffer _metaDataBuffer;
+        private readonly IntPtr _metaDataBufferPointer;
+        private readonly int _capacity;
 
         /// <summary>
         /// Construct a view over a term buffer and state buffer for appending frames.
@@ -41,7 +46,10 @@ namespace Adaptive.Aeron.LogBuffer
         public TermAppender(IAtomicBuffer termBuffer, IAtomicBuffer metaDataBuffer)
         {
             this._termBuffer = termBuffer;
+            this._termBufferPointer = termBuffer.BufferPointer;
+            this._capacity = termBuffer.Capacity;
             this._metaDataBuffer = metaDataBuffer;
+            this._metaDataBufferPointer = metaDataBuffer.BufferPointer;
         }
 
         /// <summary>
@@ -101,20 +109,22 @@ namespace Adaptive.Aeron.LogBuffer
         {
             int frameLength = length + DataHeaderFlyweight.HEADER_LENGTH;
             int alignedLength = BitUtil.Align(frameLength, FrameDescriptor.FRAME_ALIGNMENT);
-            long rawTail = GetAndAddRawTail(alignedLength);
+            long rawTail = Interlocked.Add(ref *(long*) (_metaDataBufferPointer + LogBufferDescriptor.TERM_TAIL_COUNTER_OFFSET), alignedLength) - alignedLength;
             long termOffset = rawTail & 0xFFFFFFFFL;
 
             IAtomicBuffer termBuffer = _termBuffer;
-            int termLength = termBuffer.Capacity;
-
+            int termLength = _capacity;
+            var termId = TermId(rawTail);
             long resultingOffset = termOffset + alignedLength;
             if (resultingOffset > termLength)
             {
-                resultingOffset = HandleEndOfLogCondition(termBuffer, termOffset, header, termLength, TermId(rawTail));
+                resultingOffset = HandleEndOfLogCondition(termBuffer, termOffset, header, termLength, termId);
             }
             else
             {
                 int offset = (int) termOffset;
+                Volatile.Write(ref *(int*) (_termBufferPointer + offset), -length);
+                header.Write(termBuffer, offset, frameLength, termId);
                 header.Write(termBuffer, offset, frameLength, TermId(rawTail));
                 bufferClaim.Wrap(termBuffer, offset, frameLength);
             }
@@ -131,27 +141,29 @@ namespace Adaptive.Aeron.LogBuffer
         /// <param name="length">    of the message in the source buffer. </param>
         /// <returns> the resulting offset of the term after the append on success otherwise <seealso cref="#TRIPPED"/> or <seealso cref="#FAILED"/>
         /// packed with the termId if a padding record was inserted at the end. </returns>
-        public virtual long AppendUnfragmentedMessage(HeaderWriter header, IDirectBuffer srcBuffer, int srcOffset, int length)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long AppendUnfragmentedMessage(HeaderWriter header, IDirectBuffer srcBuffer, int srcOffset, int length)
         {
             int frameLength = length + DataHeaderFlyweight.HEADER_LENGTH;
             int alignedLength = BitUtil.Align(frameLength, FrameDescriptor.FRAME_ALIGNMENT);
-            long rawTail = GetAndAddRawTail(alignedLength);
+            long rawTail = Interlocked.Add(ref *(long*) (_metaDataBufferPointer + LogBufferDescriptor.TERM_TAIL_COUNTER_OFFSET), alignedLength) - alignedLength;
             long termOffset = rawTail & 0xFFFFFFFFL;
 
             IAtomicBuffer termBuffer = _termBuffer;
-            int termLength = termBuffer.Capacity;
-
+            int termLength = _capacity;
+            int termId = TermId(rawTail);
             long resultingOffset = termOffset + alignedLength;
             if (resultingOffset > termLength)
             {
-                resultingOffset = HandleEndOfLogCondition(termBuffer, termOffset, header, termLength, TermId(rawTail));
+                resultingOffset = HandleEndOfLogCondition(termBuffer, termOffset, header, termLength, termId);
             }
             else
             {
-                int offset = (int) termOffset;
-                header.Write(termBuffer, offset, frameLength, TermId(rawTail));
+                var offset = (int) termOffset;
+                Volatile.Write(ref *(int*) (_termBufferPointer + offset), -length);
+                header.Write(termBuffer, offset, frameLength, termId);
                 termBuffer.PutBytes(offset + DataHeaderFlyweight.HEADER_LENGTH, srcBuffer, srcOffset, length);
-                FrameDescriptor.FrameLengthOrdered(termBuffer, offset, frameLength);
+                termBuffer.PutIntOrdered(offset, frameLength);
             }
 
             return resultingOffset;
@@ -201,6 +213,8 @@ namespace Adaptive.Aeron.LogBuffer
                     int bytesToWrite = Math.Min(remaining, maxPayloadLength);
                     int frameLength = bytesToWrite + DataHeaderFlyweight.HEADER_LENGTH;
                     int alignedLength = BitUtil.Align(frameLength, FrameDescriptor.FRAME_ALIGNMENT);
+
+                    Volatile.Write(ref *(int*) (_termBufferPointer + offset), -frameLength);
 
                     header.Write(termBuffer, offset, frameLength, termId);
                     termBuffer.PutBytes(offset + DataHeaderFlyweight.HEADER_LENGTH, srcBuffer,
